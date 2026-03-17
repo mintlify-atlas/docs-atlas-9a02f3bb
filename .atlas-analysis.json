@@ -1,0 +1,87 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "NVIDIA Video Classification",
+  "projectDescription": "An industry-sponsored deep learning system by NVIDIA that classifies videos into four content categories (Animation, Gaming, Natural Content, Flat Content) using a CNN + Bi-LSTM + Multi-Head Attention two-stage architecture.",
+  "theme": "aspen",
+  "primaryColor": "#76B900",
+  "lightColor": "#A8D86E",
+  "darkColor": "#4A7A00",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/dataset",
+              "concepts/training"
+            ]
+          },
+          {
+            "group": "Training Guide",
+            "pages": [
+              "training/preprocessing",
+              "training/model-training",
+              "training/ensemble"
+            ]
+          },
+          {
+            "group": "Inference",
+            "pages": [
+              "inference/flask-deployment",
+              "inference/single-video",
+              "inference/tta"
+            ]
+          },
+          {
+            "group": "Evaluation",
+            "pages": [
+              "evaluation/metrics",
+              "evaluation/model-cards"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Flask API",
+            "pages": [
+              "api/overview",
+              "api/videos",
+              "api/classify"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Two-stage CNN + Bi-LSTM + Multi-Head Self-Attention architecture",
+    "Multi-class video classification into Animation, Gaming, Natural Content, and Flat Content",
+    "~93-95% test accuracy with Test-Time Augmentation (TTA)",
+    "5-model ensemble for robust predictions",
+    "Pre-extracted feature-based fast inference (1280-dim EfficientNet-V2 features)",
+    "Flask REST API with JSON responses",
+    "Trained on NVIDIA A100 GPU (MIG partition) using YouTube-8M dataset",
+    "Focal Loss with Label Smoothing, AdamW optimizer, Cosine Annealing scheduler"
+  ],
+  "publicApiSurface": [
+    "GET /api/videos — List available dataset videos by category",
+    "POST /api/classify — Classify a dataset video with optional TTA",
+    "SingleVideoFeatureLoader.list_available_videos()",
+    "SingleVideoFeatureLoader.load_video_features(video_name)",
+    "SingleVideoClassifier.load_models()",
+    "SingleVideoClassifier.predict_standard(features)",
+    "SingleVideoClassifier.predict_with_tta(features)",
+    "SuperEnhancedTemporalModel(feature_dim, hidden_dim, num_classes, num_lstm_layers, num_attention_heads, dropout, bidirectional)",
+    "VideoPreprocessor(input_dir, output_dir, frames_per_video, img_size, clip_duration)"
+  ]
+}
