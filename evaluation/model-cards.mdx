@@ -1,0 +1,185 @@
+---
+title: "Model cards"
+description: "Technical specifications for each ensemble model checkpoint"
+---
+
+## Shared architecture and training configuration
+
+All four checkpoints use identical architecture (`SuperEnhancedTemporalModel`) and training hyperparameters. They differ only in training trajectory (random seed / convergence behavior).
+
+### Architecture
+
+| Parameter | Value |
+|---|---|
+| Model class | `SuperEnhancedTemporalModel` |
+| `feature_dim` | 1280 |
+| `hidden_dim` | 768 |
+| `num_classes` | 4 |
+| `num_lstm_layers` | 4 |
+| `num_attention_heads` | 12 |
+| `dropout` | 0.4 |
+| `bidirectional` | `True` |
+
+### Training configuration
+
+| Parameter | Value |
+|---|---|
+| Learning rate | 0.001 |
+| Batch size | 48 |
+| Max epochs | 150 |
+| Early stopping patience | 25 |
+
+### Hardware and software
+
+| Component | Detail |
+|---|---|
+| GPU | NVIDIA A100 MIG (9.8 GB VRAM) |
+| CUDA | 11.8 |
+| cuDNN | Enabled |
+| Framework | PyTorch |
+| Vision | Torchvision |
+| Video decode | OpenCV |
+| Numerics | NumPy, Pandas |
+| Metrics | scikit-learn |
+| Feature storage | h5py |
+
+## Checkpoints
+
+<AccordionGroup>
+  <Accordion title="best_ensemble_model_1.pt" icon="microchip">
+    **Best epoch:** 52
+
+    **Validation accuracy:** 72.73%
+
+    ### Metrics
+
+    | Metric | Value |
+    |---|---|
+    | Accuracy | 72.73% |
+    | F1 Weighted | 64.76% |
+    | F1 Animation | 1.10% |
+    | F1 Flat\_Content | 93.47% |
+    | F1 Gaming | 66.06% |
+    | F1 Natural\_Content | 96.69% |
+
+    <Note>
+    This checkpoint has significantly lower overall accuracy and near-zero F1 on Animation. It is retained in the ensemble because its error distribution differs from models 2–4, which adds diversity and improves ensemble robustness on edge cases.
+    </Note>
+
+    ### Model config
+
+    ```json
+    {
+      "feature_dim": 1280,
+      "hidden_dim": 768,
+      "num_classes": 4,
+      "num_lstm_layers": 4,
+      "num_attention_heads": 12,
+      "dropout": 0.4,
+      "bidirectional": true
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="best_ensemble_model_2.pt" icon="microchip">
+    **Best epoch:** 43
+
+    **Validation accuracy:** 92.13%
+
+    ### Metrics
+
+    | Metric | Value |
+    |---|---|
+    | Accuracy | 92.13% |
+    | F1 Weighted | 92.15% |
+    | F1 Animation | 86.46% |
+    | F1 Flat\_Content | 96.74% |
+    | F1 Gaming | 87.88% |
+    | F1 Natural\_Content | 97.52% |
+
+    ### Model config
+
+    ```json
+    {
+      "feature_dim": 1280,
+      "hidden_dim": 768,
+      "num_classes": 4,
+      "num_lstm_layers": 4,
+      "num_attention_heads": 12,
+      "dropout": 0.4,
+      "bidirectional": true
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="best_ensemble_model_3.pt" icon="microchip">
+    **Best epoch:** 42
+
+    **Validation accuracy:** 91.86%
+
+    ### Metrics
+
+    | Metric | Value |
+    |---|---|
+    | Accuracy | 91.86% |
+    | F1 Weighted | 91.87% |
+    | F1 Animation | 87.67% |
+    | F1 Flat\_Content | 95.47% |
+    | F1 Gaming | 88.00% |
+    | F1 Natural\_Content | 96.38% |
+
+    ### Model config
+
+    ```json
+    {
+      "feature_dim": 1280,
+      "hidden_dim": 768,
+      "num_classes": 4,
+      "num_lstm_layers": 4,
+      "num_attention_heads": 12,
+      "dropout": 0.4,
+      "bidirectional": true
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="best_ensemble_model_4.pt" icon="microchip">
+    **Best epoch:** 40
+
+    **Validation accuracy:** 91.86%
+
+    ### Metrics
+
+    | Metric | Value |
+    |---|---|
+    | Accuracy | 91.86% |
+    | F1 Weighted | 91.88% |
+    | F1 Animation | 88.02% |
+    | F1 Flat\_Content | 95.24% |
+    | F1 Gaming | 88.48% |
+    | F1 Natural\_Content | 95.77% |
+
+    ### Model config
+
+    ```json
+    {
+      "feature_dim": 1280,
+      "hidden_dim": 768,
+      "num_classes": 4,
+      "num_lstm_layers": 4,
+      "num_attention_heads": 12,
+      "dropout": 0.4,
+      "bidirectional": true
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Team
+
+| Role | Name |
+|---|---|
+| Team member | Manas Kulkarni |
+| Team member | Samiksha Nalawade |
+| Team member | Rajlakshmi Desai |
+| Faculty guide | Dr. Shripad Bhatlawande |

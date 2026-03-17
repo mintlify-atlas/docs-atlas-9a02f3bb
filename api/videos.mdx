@@ -1,0 +1,100 @@
+---
+title: "GET /api/videos"
+description: "List all available videos in the dataset, grouped by category"
+---
+
+## Endpoint
+
+```
+GET /api/videos
+```
+
+Returns all videos that the classifier can process, organized by content category. Each video in the response corresponds to pre-extracted HDF5 features stored in the `features_enhanced/` directory (`test_features_multiscale.h5`).
+
+## Request parameters
+
+None.
+
+## Response
+
+<ResponseField name="success" type="boolean" required>
+  `true` on success, `false` on error.
+</ResponseField>
+
+<ResponseField name="videos" type="object">
+  Map of category names to lists of video filenames.
+
+  <Expandable title="properties">
+    <ResponseField name="Animation" type="string[]">
+      Video filenames in the Animation category.
+    </ResponseField>
+    <ResponseField name="Flat_Content" type="string[]">
+      Video filenames in the Flat\_Content category.
+    </ResponseField>
+    <ResponseField name="Gaming" type="string[]">
+      Video filenames in the Gaming category.
+    </ResponseField>
+    <ResponseField name="Natural_Content" type="string[]">
+      Video filenames in the Natural\_Content category.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Success response example
+
+```json
+{
+  "success": true,
+  "videos": {
+    "Animation": ["video1.mp4", "video2.mp4"],
+    "Gaming": ["video3.mp4"],
+    "Natural_Content": ["video4.mp4"],
+    "Flat_Content": ["video5.mp4"]
+  }
+}
+```
+
+### Error response
+
+If the feature loader fails to initialize (e.g., `test_features_multiscale.h5` is missing), the endpoint returns HTTP 500:
+
+```json
+{
+  "success": false,
+  "error": "No test_features*.h5 file found in /path/to/features_enhanced",
+  "trace": "Traceback (most recent call last): ..."
+}
+```
+
+## Examples
+
+<CodeGroup>
+
+```bash curl
+curl http://localhost:5000/api/videos
+```
+
+```python Python
+import requests
+
+response = requests.get("http://localhost:5000/api/videos")
+data = response.json()
+
+if data["success"]:
+    for category, videos in data["videos"].items():
+        print(f"{category}: {len(videos)} videos")
+else:
+    print("Error:", data["error"])
+```
+
+</CodeGroup>
+
+## About pre-extracted features
+
+The response reflects the contents of `test_features_multiscale.h5` — a pre-built HDF5 file containing EfficientNet-B0 features for every test video. The feature file stores:
+
+- Feature tensors of shape `[T, 1280]` per video (up to 73 frames)
+- Integer labels aligned to the category mapping
+- A `category_mapping` attribute: `{"Animation": 0, "Flat_Content": 1, "Gaming": 2, "Natural_Content": 3}`
+
+Only videos whose features are present in this file can be classified. External video uploads are not supported by this endpoint.

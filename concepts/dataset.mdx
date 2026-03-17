@@ -1,0 +1,157 @@
+---
+title: "Dataset"
+description: "YouTube-8M derived dataset with 4 main categories and 46 subcategories"
+---
+
+The training data consists of approximately 4,000 videos sourced from [YouTube-8M](https://research.google.com/youtube8m/). Videos span 4 top-level content categories broken into 46 subcategories that reflect real-world YouTube content diversity.
+
+## Dataset split
+
+| Split | Proportion | Test set size |
+|---|---|---|
+| Train | 70% | — |
+| Validation | 20% | — |
+| Test | 10% | 412 videos |
+
+<Info>The test feature file (`test_features_multiscale.h5`) contains 412 videos with features of shape `[412, 73, 1280]`.</Info>
+
+## Category structure
+
+The `category_structure` dict below is taken verbatim from `preprocess_videos.py`. Each top-level key is a main class; the list values are the YouTube-8M tag names used to source videos for that class.
+
+```python
+self.category_structure = {
+    'Animation': [
+        'Cartoon', 'Animation', 'Lego minifigure', 'Naruto',
+        'The Walt Disney Company', 'Dragon Ball', 'Sonic the Hedgehog',
+        'One Piece', 'Bleach'
+    ],
+    'Gaming': [
+        'Games', 'Video game', 'Minecraft', 'Call of Duty',
+        'Grand Theft Auto', 'Grand Theft Auto V', 'World of Warcraft',
+        'League of Legends', 'Battlefield', 'RuneScape',
+        'Action-adventure game', 'FIFA 15'
+    ],
+    'Natural_Content': [
+        'Animal', 'Pet', 'Fishing', 'Fish', 'Outdoor recreation', 'Dog',
+        'Horse', 'Bird', 'Plant', 'Cat', 'Farm', 'Garden', 'Nature',
+        'Tree', 'Wildlife', 'Chicken'
+    ],
+    'Flat_Content': [
+        'Website', 'Chart', 'Map', 'Logo', 'Text', 'Typography',
+        'Screencast', 'Illustration', 'Poster'
+    ]
+}
+```
+
+## Category breakdown
+
+| Class ID | Category | Subcategory count | Example tags |
+|---|---|---|---|
+| 0 | Animation | 9 | Cartoon, Dragon Ball, Naruto, Bleach |
+| 1 | Flat_Content | 9 | Website, Chart, Screencast, Poster |
+| 2 | Gaming | 12 | Minecraft, Call of Duty, League of Legends |
+| 3 | Natural_Content | 16 | Animal, Dog, Bird, Wildlife |
+
+<Note>The class ID order used at inference time is `{"Animation": 0, "Flat_Content": 1, "Gaming": 2, "Natural_Content": 3}` as stored in the HDF5 feature files.</Note>
+
+## Class imbalance
+
+Natural_Content has the most subcategories (16) and tends to be the largest class by video count. Animation subcategories such as specific anime titles can be sparse. To compensate, training uses `WeightedRandomSampler` so that every class is sampled proportionally regardless of its raw count:
+
+```python
+sample_weights = train_dataset.get_sample_weights()
+sampler = WeightedRandomSampler(
+    weights=sample_weights,
+    num_samples=len(train_dataset),
+    replacement=True
+)
+
+train_loader = DataLoader(
+    train_dataset, batch_size=batch_size, sampler=sampler,
+    num_workers=num_workers, collate_fn=collate_features,
+    pin_memory=True, persistent_workers=True
+)
+```
+
+Per-class weights are computed as:
+
+```python
+def _compute_class_weights(self):
+    num_classes = len(self.class_counts)
+    total_samples = len(self.labels)
+
+    weights = []
+    for class_id in range(num_classes):
+        if class_id in self.class_counts:
+            weight = total_samples / (num_classes * self.class_counts[class_id])
+            weight = min(max(weight, 0.5), 10.0)  # Clamped to [0.5, 10.0]
+        else:
+            weight = 1.0
+        weights.append(weight)
+
+    return torch.FloatTensor(weights)
+```
+
+<Tip>The same class weights are passed as `alpha` to `FocalLoss`, giving a second layer of imbalance correction during loss computation.</Tip>
+
+## Preprocessing pipeline
+
+Videos are processed by `VideoPreprocessor` before feature extraction. The key parameters are set in `configuration_analysis.json`:
+
+```json
+{
+  "preprocessing_info": {
+    "frames_per_video": 64,
+    "image_size": [256, 256],
+    "processing_mode": "gpu"
+  }
+}
+```
+
+Each video is uniformly sampled to 64 frames. Frames are then passed through the transform pipeline:
+
+```python
+self.transform = transforms.Compose([
+    transforms.Resize(int(img_size[0] * 1.15)),   # 256 × 1.15 = 294
+    transforms.CenterCrop(img_size),              # 256×256
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+```
+
+## Feature file specification
+
+Extracted features are stored in HDF5 files, one per split. The test file metadata from `configuration_analysis.json`:
+
+```json
+{
+  "feature_file_info": {
+    "feature_file": "test_features_multiscale.h5",
+    "feature_dim": 1280,
+    "max_frames": 73,
+    "multi_scale": true,
+    "num_videos": 412,
+    "features_shape": [412, 73, 1280]
+  }
+}
+```
+
+| Field | Value | Description |
+|---|---|---|
+| `feature_dim` | 1280 | EfficientNet-V2-S output dimension |
+| `max_frames` | 73 | Padded sequence length (multi-scale expands beyond 64) |
+| `multi_scale` | `true` | Average of 1.0×, 0.85×, 1.15× temporal scales |
+| `num_videos` | 412 | Number of test videos |
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="cpu" href="/concepts/architecture">
+    How frames are processed by the CNN backbone and fed to the temporal model.
+  </Card>
+  <Card title="Training strategy" icon="chart-line" href="/concepts/training">
+    How class imbalance is handled during training with Focal Loss and WeightedRandomSampler.
+  </Card>
+</CardGroup>

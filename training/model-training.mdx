@@ -1,0 +1,301 @@
+---
+title: "Model training"
+description: "Train the SuperEnhancedTemporalModel with Focal Loss, AdamW, and Cosine Annealing"
+---
+
+The second stage of the pipeline trains a temporal sequence model on the CNN
+features produced by the preprocessor. The target is **>95 % validation
+accuracy** on 4 content classes.
+
+## Model architecture: SuperEnhancedTemporalModel
+
+`SuperEnhancedTemporalModel` in `model_train_new.py` is a bidirectional LSTM
+with multi-head self-attention and an attention-pooled classifier head.
+
+```
+Input [B, T, 1280]
+  └─ Linear projection → LayerNorm → ReLU → Dropout(0.2)
+       [B, T, 768]
+  └─ Bidirectional LSTM (4 layers, hidden=768)
+       [B, T, 1536]
+  └─ Multi-head self-attention (12 heads) + residual + LayerNorm
+       [B, T, 1536]
+  └─ Attention pooling (linear → tanh → softmax weights → weighted sum)
+       [B, 1536]
+  └─ Classifier: 1536 → 768 → 512 → 256 → 4
+       [B, 4]
+```
+
+```python
+from model_train_new import SuperEnhancedTemporalModel
+
+model = SuperEnhancedTemporalModel(
+    feature_dim=1280,
+    hidden_dim=768,
+    num_classes=4,
+    num_lstm_layers=4,
+    num_attention_heads=12,
+    dropout=0.4,
+    bidirectional=True,
+)
+```
+
+## Hyperparameters
+
+| Parameter | Value | Source |
+|---|---|---|
+| `feature_dim` | 1280 | EfficientNet-V2-S output |
+| `hidden_dim` | 768 | model config |
+| `num_classes` | 4 | Animation, Flat\_Content, Gaming, Natural\_Content |
+| `num_lstm_layers` | 4 | model config |
+| `num_attention_heads` | 12 | model config |
+| `dropout` | 0.4 | model config |
+| `bidirectional` | `True` | model config |
+| `learning_rate` | 0.001 | training config |
+| `batch_size` | 48 | training config |
+| `num_epochs` | 150 | training config |
+| `patience` | 25 | early stopping |
+| `weight_decay` | 5e-4 | AdamW |
+| `gradient_clip` | 1.0 | per-batch |
+
+## Class imbalance handling
+
+Class weights are computed per-split and used in two places:
+
+1. **`WeightedRandomSampler`** — oversamples minority classes during training
+2. **`FocalLoss(alpha=class_weights)`** — up-weights hard/rare examples in the loss
+
+```python
+from torch.utils.data import WeightedRandomSampler
+
+sample_weights = train_dataset.get_sample_weights()
+sampler = WeightedRandomSampler(
+    weights=sample_weights,
+    num_samples=len(train_dataset),
+    replacement=True,
+)
+```
+
+The per-class weight formula clips the result to `[0.5, 10.0]`:
+
+```python
+weight = total_samples / (num_classes * class_count)
+weight = min(max(weight, 0.5), 10.0)
+```
+
+## Loss function: Focal Loss with label smoothing
+
+`FocalLoss` combines **label smoothing** (reduces overconfidence) with the
+**focal weighting** term `(1 - p_t)^gamma` that down-weights well-classified
+examples.
+
+```python
+from model_train_new import FocalLoss
+
+criterion = FocalLoss(
+    alpha=class_weights.to(device),  # per-class weight tensor
+    gamma=2.0,                       # focusing parameter
+    smoothing=0.1,                   # label smoothing coefficient
+)
+```
+
+| Parameter | Value | Effect |
+|---|---|---|
+| `gamma` | 2.0 | Focuses on hard examples; `gamma=0` recovers cross-entropy |
+| `smoothing` | 0.1 | Target confidence is `0.9` instead of `1.0` |
+| `alpha` | class weights | Scales loss by inverse class frequency |
+
+## Optimiser and scheduler
+
+```python
+import torch.optim as optim
+
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=1e-3,
+    weight_decay=5e-4,
+    betas=(0.9, 0.999),
+)
+
+scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    optimizer,
+    T_0=20,    # initial restart period (epochs)
+    T_mult=2,  # period doubles after each restart
+    eta_min=1e-6,
+)
+```
+
+The scheduler steps **per batch** inside the training loop:
+
+```python
+optimizer.zero_grad()
+outputs = model(features, lengths)
+loss = criterion(outputs, labels)
+loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+optimizer.step()
+scheduler.step()  # called every batch, not every epoch
+```
+
+## Training loop structure
+
+```python
+from model_train_new import EnhancedTemporalModelTrainer
+
+trainer = EnhancedTemporalModelTrainer(
+    features_dir="/workspace/.../features_enhanced",
+    output_dir="/workspace/.../models_enhanced",
+    device='cuda',
+)
+
+model, results = trainer.train_single_model(
+    num_epochs=150,
+    batch_size=48,
+    learning_rate=1e-3,
+    model_name='ensemble_model_1',
+    feature_file_suffix='_multiscale',  # loads *_features_multiscale.h5
+    results_dir='/workspace/.../results',
+)
+```
+
+The trainer internally calls `train_epoch()` then `validate()` each epoch,
+updates history, generates visualisations, saves the best checkpoint, and
+applies early stopping.
+
+## Checkpoint saving
+
+The trainer saves two kinds of checkpoints:
+
+**Best model** — updated every time validation accuracy improves:
+
+```
+models_enhanced/best_ensemble_model_1.pt
+```
+
+**Periodic checkpoint** — saved every 20 epochs, keeping only the last 3:
+
+```
+models_enhanced/ensemble_model_1_checkpoint_epoch_040.pt
+```
+
+Each `.pt` file contains:
+
+```python
+{
+    'epoch': int,
+    'model_state_dict': ...,
+    'optimizer_state_dict': ...,
+    'metrics': { 'accuracy': ..., 'f1_weighted': ..., 'f1_per_class': [...] },
+    'history': { 'train_loss': [...], 'val_acc': [...], ... },
+    'best_val_acc': float,
+    'model_config': {
+        'feature_dim': 1280, 'hidden_dim': 768, 'num_classes': 4,
+        'num_lstm_layers': 4, 'num_attention_heads': 12,
+        'dropout': 0.4, 'bidirectional': True
+    },
+    'training_config': {
+        'learning_rate': 0.001, 'batch_size': 48,
+        'num_epochs': 150, 'patience': 25
+    },
+}
+```
+
+## Training metrics
+
+Metrics logged each epoch:
+
+| Metric | Description |
+|---|---|
+| `train_loss` / `val_loss` | Average Focal Loss |
+| `train_acc` / `val_acc` | Top-1 accuracy (%) |
+| `train_f1` / `val_f1` | Weighted F1 score (%) |
+| `val_per_class_f1` | Per-class F1 for all 4 classes |
+| `learning_rates` | Current LR at each epoch |
+
+## Visualisation
+
+`RealTimeTrainingVisualizer` generates a six-panel PNG after every epoch saved
+to `results/training_progress/`:
+
+- Training & validation loss
+- Training & validation accuracy (with 95 % target line)
+- F1 progression
+- Current vs. best metrics summary
+- Learning rate schedule (log scale)
+- Per-class F1 bar chart
+
+An epoch-by-epoch PNG is also saved to `training_progress/epoch_plots/` and
+an optional animated GIF is created at the end of training.
+
+```
+results/
+└── training_progress/
+    ├── ensemble_model_1_current.png
+    ├── training_metrics.csv
+    ├── training_summary.json
+    └── epoch_plots/
+        ├── epoch_000.png
+        ├── epoch_001.png
+        └── ...
+```
+
+## ResourceMonitor
+
+`ResourceMonitor` runs in a background thread and logs GPU, RAM, and CPU
+utilisation every 30 minutes to `resource_utilization_log.json`.
+
+```python
+from model_train_new import ResourceMonitor
+
+monitor = ResourceMonitor(
+    output_dir='/workspace/.../results',
+    interval_minutes=30,
+)
+monitor.start_monitoring()
+
+# ... training ...
+
+monitor.stop_monitoring()
+print(monitor.get_summary())
+```
+
+Log entries:
+
+```json
+[
+  {
+    "timestamp": "2025-10-27T14:00:00",
+    "cpu_percent": 42.3,
+    "ram_used_gb": 18.7,
+    "ram_total_gb": 251.0,
+    "ram_percent": 7.4,
+    "gpu_allocated_gb": 6.1,
+    "gpu_reserved_gb": 7.2,
+    "gpu_max_allocated_gb": 6.8
+  }
+]
+```
+
+## Training time and hardware
+
+| Item | Value |
+|---|---|
+| Target hardware | NVIDIA A100 MIG (9.8 GB VRAM) |
+| Training time per model | 30–50 hours |
+| GPU VRAM budget | \~9.6 GB |
+| System RAM | 251 GB |
+
+<Tip>
+  To train the full 5-model ensemble unattended, call `trainer.train_ensemble(num_models=5)` instead of
+  `train_single_model`. Each model uses a different random seed (`42 + i`) so the ensemble
+  members are genuinely diverse.
+</Tip>
+
+<CardGroup cols={2}>
+  <Card title="Video preprocessing" icon="film" href="/training/preprocessing">
+    Extract frames and CNN features before training
+  </Card>
+  <Card title="Model ensemble" icon="layer-group" href="/training/ensemble">
+    Combine trained checkpoints to reach >95 % accuracy
+  </Card>
+</CardGroup>

@@ -1,0 +1,291 @@
+---
+title: "Video preprocessing"
+description: "Extract frames from raw videos and generate CNN features for training"
+---
+
+Preprocessing happens in two sequential stages:
+
+1. **Frame extraction** — decode each raw `.mp4` file and sample up to 64 frames per clip
+2. **CNN feature extraction** — run the sampled frames through a pretrained backbone and store the resulting per-frame embedding vectors in an HDF5 file
+
+The output of stage 2 (`test_features_multiscale.h5`) is the only artifact consumed by the training script.
+
+<Warning>
+  You must set `CUDA_VISIBLE_DEVICES='0'` **before** importing `torch`. The first line of
+  `preprocess_videos.py` does this for you, but if you import the module from another script you
+  must set the environment variable yourself before any CUDA context is created.
+
+  ```python
+  import os
+  os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+  import torch  # safe to import now
+  ```
+</Warning>
+
+## VideoPreprocessor class
+
+`VideoPreprocessor` in `src/data/preprocess_videos.py` handles both stages.
+
+### Constructor
+
+```python
+from src.data.preprocess_videos import VideoPreprocessor
+
+preprocessor = VideoPreprocessor(
+    input_dir="/workspace/.../data/raw",
+    output_dir="/workspace/.../data/processed",
+    frames_per_video=64,
+    img_size=(256, 256),
+    clip_duration=10,
+)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `input_dir` | `str` | — | Root of the raw video tree |
+| `output_dir` | `str` | — | Destination for processed `.pt` files |
+| `frames_per_video` | `int` | `64` | Frames sampled per clip |
+| `img_size` | `tuple` | `(256, 256)` | Target (height, width) after crop |
+| `clip_duration` | `int` | `10` | Duration in seconds for `middle_clip` / `random_clip` strategies |
+
+### Category structure
+
+The preprocessor maps raw subcategory folder names to four top-level class labels. The exact mapping used in production:
+
+```python
+category_structure = {
+    'Animation': [
+        'Cartoon', 'Animation', 'Lego minifigure', 'Naruto',
+        'The Walt Disney Company', 'Dragon Ball', 'Sonic the Hedgehog',
+        'One Piece', 'Bleach'
+    ],
+    'Gaming': [
+        'Games', 'Video game', 'Minecraft', 'Call of Duty',
+        'Grand Theft Auto', 'Grand Theft Auto V', 'World of Warcraft',
+        'League of Legends', 'Battlefield', 'RuneScape',
+        'Action-adventure game', 'FIFA 15'
+    ],
+    'Natural_Content': [
+        'Animal', 'Pet', 'Fishing', 'Fish', 'Outdoor recreation', 'Dog',
+        'Horse', 'Bird', 'Plant', 'Cat', 'Farm', 'Garden', 'Nature',
+        'Tree', 'Wildlife', 'Chicken'
+    ],
+    'Flat_Content': [
+        'Website', 'Chart', 'Map', 'Logo', 'Text', 'Typography',
+        'Screencast', 'Illustration', 'Poster'
+    ],
+}
+```
+
+### setup_processing_mode()
+
+Call this before processing to choose CPU or GPU mode. On GPU the batch size is
+automatically calculated from available MIG memory (using 40 % of free VRAM as
+a safety margin).
+
+```python
+preprocessor.setup_processing_mode()  # prompts: 1=CPU, 2=GPU
+```
+
+**CPU mode** — `batch_size=1`, works on any system  
+**GPU mode** — uses `cuda:0` explicitly (MIG-compatible); `batch_size` is
+derived from `free_memory * 0.4 / bytes_per_video` capped at 4
+
+### Transforms pipeline
+
+The same normalisation pipeline is applied regardless of CPU or GPU mode:
+
+```python
+transform = transforms.Compose([
+    transforms.Resize(int(img_size[0] * 1.15)),   # 256 * 1.15 = 294
+    transforms.CenterCrop(img_size),              # (256, 256)
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    ),
+])
+```
+
+The `Resize` step upscales slightly before the crop to avoid edge artefacts.
+
+## Frame sampling strategies
+
+| Strategy | Description |
+|---|---|
+| `uniform` | Sample evenly across the full video duration |
+| `middle_clip` | Sample within the central `clip_duration` seconds |
+| `random_clip` | Sample within a random `clip_duration`-second window |
+| `multi_clip` | Sample from three positions: 20 %, 50 %, 80 % of the video |
+| `adaptive_multi_clip` | `multi_clip` for Gaming/Animation; `middle_clip` for everything else |
+
+<Tip>
+  For **Gaming** and **Animation** content, use `adaptive_multi_clip`. These categories benefit
+  from temporal diversity because action can happen at any point in the clip.
+</Tip>
+
+## Stage 2: CNN feature extraction
+
+After frame extraction, `EnhancedFeatureExtractor` (in `model_train_new.py`) runs each
+processed `.pt` tensor through a frozen pretrained backbone.
+
+### Backbone options
+
+| Backbone | Output dim | Weights |
+|---|---|---|
+| `resnet50` | 2048 | `IMAGENET1K_V2` |
+| `resnet101` | 2048 | `IMAGENET1K_V2` |
+| `efficientnet_v2_s` | 1280 | `IMAGENET1K_V1` |
+| `efficientnet_v2_m` | 1280 | `IMAGENET1K_V1` |
+
+The production configuration uses **EfficientNet-V2-S**, which yields a
+`feature_dim` of **1280**.
+
+```python
+from model_train_new import EnhancedFeatureExtractor
+
+extractor = EnhancedFeatureExtractor(
+    data_dir="/workspace/.../data/processed",
+    output_dir="/workspace/.../features_enhanced",
+    backbone='efficientnet_v2_s',
+    device='cuda',
+    multi_scale=True,
+)
+extractor.extract_all_splits(batch_size=24)
+```
+
+### Multi-scale temporal features
+
+When `multi_scale=True` the extractor processes each video at three temporal
+scales and averages the resulting frame-level embeddings:
+
+```python
+scales = [1.0, 0.85, 1.15]
+# scale < 1.0  → fewer frames (speed-up effect)
+# scale > 1.0  → more frames (slow-down effect)
+# Results are zero-padded to max_len then averaged across the three scales
+```
+
+### HDF5 output format
+
+Features are saved to `{split}_features_multiscale.h5` (e.g. `test_features_multiscale.h5`):
+
+```
+test_features_multiscale.h5
+├── features      float32  [N, max_frames, 1280]   (gzip compressed)
+├── labels        int64    [N]
+└── num_frames    int32    [N]
+
+attrs:
+  num_videos        412
+  max_frames        73
+  feature_dim       1280
+  category_mapping  '{"Animation": 0, "Flat_Content": 1, "Gaming": 2, "Natural_Content": 3}'
+  multi_scale       True
+```
+
+## Expected directory structure
+
+Raw videos must follow this layout before preprocessing:
+
+```
+data/raw/
+├── Animation/
+│   ├── Cartoon/
+│   │   ├── video_001.mp4
+│   │   └── video_002.mp4
+│   └── Dragon Ball/
+│       └── ...
+├── Gaming/
+│   └── Minecraft/
+│       └── ...
+├── Natural_Content/
+│   └── Dog/
+│       └── ...
+data/processed/          ← output of VideoPreprocessor
+├── train/
+│   └── Animation/
+│       └── Cartoon/
+│           ├── processed_data.pt
+│           └── metadata.json
+├── val/
+└── test/
+```
+
+Each `processed_data.pt` file stores a dict with keys `videos`, `labels`,
+`filenames`, and `category_mapping`.
+
+## Running preprocessing
+
+<Steps>
+  <Step title="Set CUDA_VISIBLE_DEVICES">
+    ```bash
+    export CUDA_VISIBLE_DEVICES=0
+    ```
+  </Step>
+
+  <Step title="Start the preprocessor">
+    ```bash
+    python src/data/preprocess_videos.py
+    ```
+
+    Or call it from Python:
+
+    ```python
+    from src.data.preprocess_videos import VideoPreprocessor
+
+    preprocessor = VideoPreprocessor(
+        input_dir="/workspace/.../data/raw",
+        output_dir="/workspace/.../data/processed",
+        frames_per_video=64,
+        img_size=(256, 256),
+        clip_duration=10,
+    )
+    preprocessor.interactive_process()
+    ```
+  </Step>
+
+  <Step title="Choose processing mode">
+    Select `1` for CPU or `2` for GPU when prompted.
+  </Step>
+
+  <Step title="Choose preprocessing mode">
+    Select `1` for interactive (configure each subcategory separately) or `2`
+    for bulk (configure all strategies first, then process unattended).
+  </Step>
+
+  <Step title="Run feature extraction">
+    ```python
+    from model_train_new import EnhancedFeatureExtractor
+
+    extractor = EnhancedFeatureExtractor(
+        data_dir="/workspace/.../data/processed",
+        output_dir="/workspace/.../features_enhanced",
+        backbone='efficientnet_v2_s',
+        device='cuda',
+        multi_scale=True,
+    )
+    extractor.extract_all_splits(batch_size=24)
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Preprocessing automatically saves a **resume checkpoint** to
+  `output_dir/resume_checkpoint.json` after each subcategory completes. If the
+  process is interrupted, simply restart it — it will skip already-processed
+  subcategories and continue from where it left off.
+
+  ```json
+  { "last_category": "Gaming", "last_subcategory": "Minecraft" }
+  ```
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="Model training" icon="brain" href="/training/model-training">
+    Train SuperEnhancedTemporalModel on the extracted features
+  </Card>
+  <Card title="Model ensemble" icon="layer-group" href="/training/ensemble">
+    Combine multiple checkpoints to push accuracy above 95 %
+  </Card>
+</CardGroup>

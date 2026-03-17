@@ -1,0 +1,80 @@
+---
+title: "Evaluation metrics"
+description: "Performance metrics for the trained ensemble: accuracy, F1 scores, and class-level breakdown"
+---
+
+## Overview
+
+All metrics are computed on the YouTube-8M test split — 10% of ~4,000 videos, giving approximately **412 test videos** (confirmed by `test_features_multiscale.h5`). The feature file contains 412 samples across four categories: Animation, Flat\_Content, Gaming, and Natural\_Content.
+
+The evaluation uses:
+
+- **Accuracy** — fraction of correctly classified samples
+- **Weighted F1** — F1 averaged across classes, weighted by class support (handles potential class imbalance)
+- **Per-class F1** — individual F1 for each of the four content categories
+
+Metrics are computed with `sklearn.metrics.f1_score` and `precision_recall_fscore_support`.
+
+## Per-checkpoint results
+
+The ensemble is built from four independently trained checkpoints. All share the same architecture and hyperparameters but differ in their random seed / training trajectory.
+
+| Model | Best Epoch | Val Accuracy | F1 Weighted | F1 Animation | F1 Flat\_Content | F1 Gaming | F1 Natural\_Content |
+|---|---|---|---|---|---|---|---|
+| `best_ensemble_model_1.pt` | 52 | 72.73% | 64.76% | 1.10% | 93.47% | 66.06% | 96.69% |
+| `best_ensemble_model_2.pt` | 43 | 92.13% | 92.15% | 86.46% | 96.74% | 87.88% | 97.52% |
+| `best_ensemble_model_3.pt` | 42 | 91.86% | 91.87% | 87.67% | 95.47% | 88.00% | 96.38% |
+| `best_ensemble_model_4.pt` | 40 | 91.86% | 91.88% | 88.02% | 95.24% | 88.48% | 95.77% |
+
+<Note>
+`best_ensemble_model_1.pt` reached only 72.73% accuracy and has a near-zero F1 on Animation (1.10%). It is kept in the ensemble because its diverse error distribution improves overall robustness — see [Model cards](/evaluation/model-cards) for details.
+</Note>
+
+## Ensemble inference performance
+
+When all four checkpoints are combined via probability averaging at inference time, the ensemble outperforms any individual model:
+
+| Mode | Accuracy | Weighted F1 |
+|---|---|---|
+| Standard (no TTA) | ~93% | ~93% |
+| With TTA | ~95% | >95% |
+
+**Test-Time Augmentation (TTA)** runs inference across four temporal augmentation modes and averages the resulting probability distributions:
+
+1. Original frame order
+2. Reversed frame order
+3. Speed-up (every other frame)
+4. Speed-down (1.5× interpolated frames)
+
+## Class-level analysis
+
+Across all checkpoints, **Gaming** and **Natural\_Content** consistently achieve the highest per-class F1 scores (95–97%). This suggests those categories have more visually distinctive temporal signatures in the EfficientNet-B0 feature space.
+
+**Flat\_Content** also classifies reliably (~95% F1) across models 2–4.
+
+**Animation** is the most difficult class for model 1 (1.10% F1) but recovers to 86–88% across models 2–4. The ensemble averaging mitigates model 1's failure on this class.
+
+## Why weighted F1
+
+Weighted F1 accounts for class imbalance by weighting each class's F1 by its number of true samples. For a dataset drawn from YouTube-8M — where content categories may not be uniformly distributed — accuracy alone can be misleading if one class dominates. Weighted F1 gives a single number that reflects real-world classification quality across all four categories proportionally.
+
+## Implementation
+
+Metrics are computed using scikit-learn:
+
+```python
+from sklearn.metrics import f1_score, precision_recall_fscore_support
+
+# Weighted F1
+f1_weighted = f1_score(y_true, y_pred, average='weighted') * 100
+
+# Per-class F1
+f1_per_class = f1_score(y_true, y_pred, average=None) * 100
+# Order: [Animation, Flat_Content, Gaming, Natural_Content]
+```
+
+Category index mapping (from `test_features_multiscale.h5` attributes):
+
+```json
+{"Animation": 0, "Flat_Content": 1, "Gaming": 2, "Natural_Content": 3}
+```

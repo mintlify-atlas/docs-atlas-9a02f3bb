@@ -1,0 +1,171 @@
+---
+title: "Training strategy"
+description: "Focal Loss, AdamW, Cosine Annealing, and ensemble training for 93-95% accuracy"
+---
+
+Training is implemented in PyTorch. The strategy combines a specialized loss function for class imbalance, an adaptive optimizer, a cyclical learning rate schedule, and an ensemble of 5 independently trained models.
+
+## Loss function: Focal Loss with label smoothing
+
+Standard cross-entropy treats every sample equally regardless of how easy or hard it is. Focal Loss down-weights well-classified examples so the model focuses learning effort on difficult or rare cases — directly addressing class imbalance without relying solely on sampling.
+
+Label smoothing (ε = 0.1) prevents overconfident predictions and improves calibration.
+
+```python
+class FocalLoss(nn.Module):
+    """Focal Loss with label smoothing"""
+
+    def __init__(self, alpha=None, gamma=2.0, smoothing=0.1):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.smoothing = smoothing
+
+    def forward(self, inputs, targets):
+        num_classes = inputs.shape[1]
+
+        # Label smoothing
+        confidence = 1.0 - self.smoothing
+        smooth_targets = torch.zeros_like(inputs)
+        smooth_targets.fill_(self.smoothing / (num_classes - 1))
+        smooth_targets.scatter_(1, targets.unsqueeze(1), confidence)
+
+        # Focal weighting
+        log_probs = F.log_softmax(inputs, dim=1)
+        ce_loss = -(smooth_targets * log_probs).sum(dim=1)
+
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+
+        if self.alpha is not None:
+            if self.alpha.device != inputs.device:
+                self.alpha = self.alpha.to(inputs.device)
+            at = self.alpha.gather(0, targets)
+            focal_loss = at * focal_loss
+
+        return focal_loss.mean()
+```
+
+The `alpha` parameter receives per-class weights computed from `WeightedRandomSampler` (see [Dataset](/concepts/dataset)), giving a second layer of imbalance correction on top of the modulating factor.
+
+## Optimizer: AdamW
+
+```python
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=learning_rate,        # 0.001
+    weight_decay=5e-4,
+    betas=(0.9, 0.999)
+)
+```
+
+Weight decay (`5e-4`) acts as L2 regularization on all parameters, penalizing large weights and reducing overfitting on the ~4,000-video dataset.
+
+## Learning rate scheduler: Cosine Annealing with Warm Restarts
+
+```python
+scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    optimizer,
+    T_0=20,       # First restart after 20 epochs
+    T_mult=2,     # Each subsequent cycle doubles in length
+    eta_min=1e-6  # Minimum learning rate floor
+)
+```
+
+The scheduler steps every batch (not every epoch), producing smooth cosine decay within each cycle. Warm restarts allow the optimizer to escape local minima by briefly increasing the learning rate at each restart boundary.
+
+## Training configuration
+
+All values below come from `configuration_analysis.json`:
+
+```json
+{
+  "training_config": {
+    "learning_rate": 0.001,
+    "batch_size": 48,
+    "num_epochs": 150,
+    "patience": 25
+  }
+}
+```
+
+| Hyperparameter | Value | Notes |
+|---|---|---|
+| `batch_size` | 48 | Fits within 9.8 GB VRAM with gradient checkpointing |
+| `num_epochs` | 150 | Upper bound; early stopping typically triggers before this |
+| `patience` | 25 | Early stopping patience on validation accuracy |
+| `learning_rate` | 0.001 | Initial LR; decays to `1e-6` minimum |
+| `weight_decay` | 5e-4 | AdamW L2 regularization |
+| `gamma` | 2.0 | Focal Loss modulating exponent |
+| `smoothing` | 0.1 | Label smoothing coefficient |
+
+## Regularization
+
+Three complementary regularization techniques are applied:
+
+| Technique | Implementation | Where |
+|---|---|---|
+| Dropout (0.4) | `nn.Dropout(dropout)` | Between every classifier layer; 0.2 in projection |
+| Gradient clipping | `clip_grad_norm_(model.parameters(), 1.0)` | Every training step |
+| Weight decay | `AdamW(weight_decay=5e-4)` | Optimizer level |
+
+```python
+loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+optimizer.step()
+```
+
+## Ensemble training
+
+Five models are trained independently with different random seeds. At inference time their softmax outputs are averaged before taking the argmax:
+
+```python
+# Ensemble inference (conceptual)
+all_probs = []
+for model in ensemble_models:
+    probs = F.softmax(model(features, lengths), dim=1)
+    all_probs.append(probs)
+
+ensemble_probs = torch.stack(all_probs).mean(dim=0)
+prediction = ensemble_probs.argmax(dim=1)
+```
+
+Checkpoints are saved as `best_ensemble_model_1.pt` through `best_ensemble_model_4.pt` (four of the five ensemble members analyzed in `configuration_analysis.json`).
+
+<Tip>Test-Time Augmentation (TTA) runs each test video through four temporal transformations — original, reversed, 2× speed-up, and 1.5× slow-down — and averages predictions. Combined with ensembling, TTA pushes accuracy to ~95%.</Tip>
+
+## Hardware
+
+| Component | Specification |
+|---|---|
+| GPU | NVIDIA A100 MIG partition, 9.8 GB VRAM |
+| CPU | Intel Xeon Gold |
+| RAM | 251 GB |
+| CUDA | 11.8 with cuDNN |
+
+<Info>The MIG partition constrains GPU memory to 9.8 GB. Batch size (48) and gradient checkpointing are tuned specifically around this limit.</Info>
+
+## Resource monitoring
+
+`ResourceMonitor` runs in a background thread and logs CPU, RAM, and GPU utilization to `resource_utilization_log.json` every 30 minutes:
+
+```python
+class ResourceMonitor:
+    """Monitor and log GPU, RAM, and CPU utilization every 30 minutes"""
+
+    def __init__(self, output_dir, interval_minutes=30):
+        self.interval_seconds = interval_minutes * 60
+        self.log_file = self.output_dir / 'resource_utilization_log.json'
+        ...
+```
+
+Estimated total training time for all 5 ensemble members is **30–50 hours** on the A100 MIG instance.
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="cpu" href="/concepts/architecture">
+    Model structure: Bi-LSTM, Multi-Head Attention, and classifier MLP.
+  </Card>
+  <Card title="Dataset" icon="database" href="/concepts/dataset">
+    Dataset split, category structure, and class imbalance handling.
+  </Card>
+</CardGroup>

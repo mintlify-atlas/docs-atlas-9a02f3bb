@@ -1,0 +1,190 @@
+---
+title: "Architecture"
+description: "Two-stage CNN + Bi-LSTM + Multi-Head Self-Attention pipeline for video classification"
+---
+
+The system uses a two-stage architecture that separates spatial feature extraction from temporal modeling. Stage 1 processes individual video frames through a pretrained CNN backbone. Stage 2 receives the resulting per-frame feature sequence and models temporal relationships to produce a final class prediction.
+
+```
+Video
+  │
+  ▼
+┌─────────────────────────────┐
+│  Stage 1: Spatial Extraction │
+│  Pretrained CNN Backbone     │
+│  (ResNet / EfficientNet-V2)  │
+│                              │
+│  64 frames @ 256×256         │
+│  → 1280-dim vector / frame   │
+└──────────────┬──────────────┘
+               │  [T × 1280] sequence
+               ▼
+┌─────────────────────────────┐
+│  Stage 2: Temporal Modeling  │
+│  Input Projection + LN       │
+│  → 4-layer Bi-LSTM           │
+│  → Multi-Head Self-Attention │
+│     (12 heads)               │
+│  → Attention Pooling         │
+│  → Classifier MLP            │
+│                              │
+│  → 4-class softmax output    │
+└─────────────────────────────┘
+```
+
+<Tabs>
+  <Tab title="Stage 1: Spatial feature extraction">
+
+## Backbone options
+
+Stage 1 supports four pretrained CNN backbones. Each is loaded with ImageNet weights and its classification head is replaced with an identity layer to expose raw feature vectors.
+
+| Backbone | Feature dim | Weights |
+|---|---|---|
+| ResNet-50 | 2048 | `IMAGENET1K_V2` |
+| ResNet-101 | 2048 | `IMAGENET1K_V2` |
+| EfficientNet-V2-S | 1280 | `IMAGENET1K_V1` |
+| EfficientNet-V2-M | 1280 | `IMAGENET1K_V1` |
+
+<Note>The production checkpoint (`best_ensemble_model_*.pt`) was extracted with EfficientNet-V2-S, yielding `feature_dim=1280`.</Note>
+
+## Frame sampling
+
+Each video is sampled to exactly 64 frames at a resolution of 256×256 pixels.
+
+## Preprocessing transforms
+
+The following torchvision transform pipeline is applied to every frame before passing it through the CNN.
+
+```python
+self.transform = transforms.Compose([
+    transforms.Resize(int(img_size[0] * 1.15)),  # Resize to 294×294 (oversample)
+    transforms.CenterCrop(img_size),             # Crop to 256×256
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+```
+
+Resizing to 115% of the target before cropping preserves aspect ratio context and avoids edge artifacts.
+
+## Multi-scale extraction
+
+When `multi_scale=True` (the default for production), features are extracted at three temporal scales — 1.0×, 0.85×, and 1.15× the original frame count — then averaged element-wise. The resulting features are stored in HDF5 format with shape `[N, T_max, 1280]`.
+
+  </Tab>
+  <Tab title="Stage 2: Temporal modeling">
+
+## SuperEnhancedTemporalModel
+
+The Stage 2 model receives the `[batch, T, 1280]` feature sequence and applies the following layers in order.
+
+```python
+class SuperEnhancedTemporalModel(nn.Module):
+    """Enhanced model with increased capacity for >95% accuracy"""
+
+    def __init__(self, feature_dim=2048, hidden_dim=768, num_classes=4,
+                 num_lstm_layers=4, num_attention_heads=12, dropout=0.4,
+                 bidirectional=True):
+        super().__init__()
+
+        # Input projection
+        self.input_projection = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5)
+        )
+
+        # 4-layer Bidirectional LSTM
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            dropout=dropout if num_lstm_layers > 1 else 0,
+            bidirectional=bidirectional
+        )
+
+        lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
+
+        # Multi-head self-attention
+        self.attention = nn.MultiheadAttention(
+            embed_dim=lstm_output_dim,
+            num_heads=num_attention_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        self.attention_norm = nn.LayerNorm(lstm_output_dim)
+        self.attention_dropout = nn.Dropout(dropout)
+
+        # Attention pooling
+        self.attention_pooling = nn.Sequential(
+            nn.Linear(lstm_output_dim, lstm_output_dim // 2),
+            nn.LayerNorm(lstm_output_dim // 2),
+            nn.Tanh(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(lstm_output_dim // 2, 1)
+        )
+
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(lstm_output_dim, 768),
+            nn.LayerNorm(768),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(768, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(256, num_classes)
+        )
+```
+
+## Layer-by-layer breakdown
+
+| Layer | Output shape | Notes |
+|---|---|---|
+| Input features | `[B, T, 1280]` | From Stage 1 |
+| Input projection | `[B, T, 768]` | Linear → LayerNorm → ReLU → Dropout(0.2) |
+| Bi-LSTM (4 layers) | `[B, T, 1536]` | `hidden_dim=768`, bidirectional doubles output |
+| Self-attention + residual | `[B, T, 1536]` | 12 heads, LayerNorm applied after residual add |
+| Attention pooling | `[B, 1536]` | Softmax-weighted sum over time |
+| Classifier MLP | `[B, 4]` | Three hidden layers with LayerNorm and Dropout |
+
+## Production model configuration
+
+The JSON below is taken directly from `configuration_analysis.json` and matches the checkpoints in `best_ensemble_model_*.pt`.
+
+```json
+{
+  "model_config": {
+    "feature_dim": 1280,
+    "hidden_dim": 768,
+    "num_classes": 4,
+    "num_lstm_layers": 4,
+    "num_attention_heads": 12,
+    "dropout": 0.4,
+    "bidirectional": true
+  }
+}
+```
+
+  </Tab>
+</Tabs>
+
+<CardGroup cols={2}>
+  <Card title="Dataset" icon="database" href="/concepts/dataset">
+    Learn about the YouTube-8M derived dataset, its 4 categories, and how videos are preprocessed.
+  </Card>
+  <Card title="Training strategy" icon="chart-line" href="/concepts/training">
+    Focal Loss, AdamW, Cosine Annealing, and ensemble training details.
+  </Card>
+</CardGroup>

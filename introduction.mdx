@@ -1,0 +1,81 @@
+---
+title: "NVIDIA Video Classification"
+description: "An industry-sponsored deep learning system that classifies videos into four content categories using a CNN + Bi-LSTM + Multi-Head Attention architecture."
+---
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Set up the project and run your first video classification in minutes
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the two-stage CNN + Bi-LSTM + Attention design
+  </Card>
+  <Card title="Training Guide" icon="graduation-cap" href="/training/preprocessing">
+    Preprocess videos, train models, and build an ensemble
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Explore the Flask REST API for inference
+  </Card>
+</CardGroup>
+
+## Overview
+
+The NVIDIA Video Classification Project is a production-grade deep learning pipeline built end-to-end as an industry-sponsored academic project. It classifies video content into four categories:
+
+| Category | Description | Subcategories |
+|---|---|---|
+| **Animation** | Animated visual content | Cartoon, Dragon Ball, One Piece, Naruto, Disney, Sonic, Bleach, Lego |
+| **Gaming** | Video game footage | Minecraft, Call of Duty, GTA, World of Warcraft, League of Legends, FIFA |
+| **Natural Content** | Real-world natural scenes | Animals, Nature, Wildlife, Pets, Outdoor Recreation, Fishing |
+| **Flat Content** | Screen-based or static visuals | Website, Chart, Map, Screencast, Logo, Typography, Illustration |
+
+## Key performance
+
+<CardGroup cols={3}>
+  <Card title="~93% Accuracy" icon="bullseye">
+    Test set accuracy without augmentation
+  </Card>
+  <Card title="~95% with TTA" icon="chart-line">
+    Test-Time Augmentation boosts accuracy further
+  </Card>
+  <Card title=">95% F1 Score" icon="award">
+    Ensemble + TTA yields balanced F1 across all classes
+  </Card>
+</CardGroup>
+
+## Architecture at a glance
+
+The system uses a **two-stage pipeline**:
+
+1. **Stage 1 — Spatial Feature Extraction**: Pretrained CNN backbones (EfficientNet-V2-S/M, ResNet-50/101) extract 1280-dimensional frame-level features from video frames.
+
+2. **Stage 2 — Temporal Modeling**: A 4-layer Bidirectional LSTM processes the frame sequence, followed by Multi-Head Self-Attention (12 heads) that identifies the most informative video segments.
+
+```
+Video → Frame Sampling → CNN Backbone → [T × 1280 features]
+                                              ↓
+                                     Bi-LSTM (4 layers)
+                                              ↓
+                                   Multi-Head Attention (12 heads)
+                                              ↓
+                                    Attention Pooling → Classifier
+                                              ↓
+                                    4-class Prediction
+```
+
+## Training setup
+
+- **Framework**: PyTorch
+- **Dataset**: YouTube-8M (~4,000 videos, 4 classes, 46 subcategories)
+- **Hardware**: NVIDIA A100 GPU (MIG — 9.8 GB VRAM), Intel Xeon Gold, 251 GB RAM
+- **Loss**: Focal Loss with Label Smoothing
+- **Optimizer**: AdamW with Cosine Annealing + Warm Restarts
+- **Ensemble**: 4–5 independently trained models
+
+## Deployment
+
+The inference system is deployed as a **Flask web application** with:
+- Pre-extracted 1280-dim features for fast inference
+- Single-video classification endpoint
+- Optional Test-Time Augmentation (TTA)
+- Per-model breakdown in API responses

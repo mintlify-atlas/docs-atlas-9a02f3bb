@@ -1,0 +1,256 @@
+---
+title: "Single video inference"
+description: "Classify a video from the dataset using pre-extracted features"
+---
+
+## How inference works
+
+Features are not computed at inference time. Instead, a pre-processing step extracts 1280-dimensional EfficientNet-B0 features for every video and stores them in an HDF5 file (`test_features_multiscale.h5`) inside `features_enhanced/`. Each video is represented as a tensor of shape `[T, D]` where `T = 73` frames and `D = 1280` feature dimensions.
+
+At inference time, the pipeline is:
+
+1. `SingleVideoFeatureLoader` reads the pre-extracted features from the HDF5 file.
+2. `SingleVideoClassifier` runs the feature tensor through the ensemble of four `SuperEnhancedTemporalModel` checkpoints.
+3. Predictions from each model are averaged (ensemble) to produce final class probabilities.
+
+<Note>
+The features tensor loaded from disk has shape `[T, D]` where `T = 73` (frames) and `D = 1280` (EfficientNet-B0 feature dimensions). When passed to the model, a batch dimension is added: `features.unsqueeze(0)` produces `[1, T, D]`.
+</Note>
+
+## SingleVideoFeatureLoader
+
+`SingleVideoFeatureLoader` indexes the test set by scanning `processed_data.pt` files in `data/processed/test/` and mapping each video name to its position in the HDF5 file.
+
+### Constructor
+
+```python
+from test_already_extracted import SingleVideoFeatureLoader
+
+loader = SingleVideoFeatureLoader(
+    features_dir="features_enhanced",
+    processed_test_dir="data/processed/test"
+)
+```
+
+<ParamField path="features_dir" type="str | Path" required>
+  Path to the directory containing `test_features*.h5`. The loader globs for the first matching file.
+</ParamField>
+
+<ParamField path="processed_test_dir" type="str | Path" required>
+  Path to `data/processed/test/`. Used to build the video-name-to-HDF5-index mapping by reading `processed_data.pt` files in each category subdirectory.
+</ParamField>
+
+### list_available_videos()
+
+Returns all videos that can be loaded, grouped by category.
+
+```python
+all_videos, videos_by_category = loader.list_available_videos()
+
+# all_videos: flat list of video names (str)
+# videos_by_category: dict[str, list[str]]
+# e.g. {"Animation": [...], "Flat_Content": [...], "Gaming": [...], "Natural_Content": [...]}
+```
+
+### load_video_features(video_name)
+
+Loads the pre-extracted feature tensor for a specific video.
+
+```python
+features, label, category_name = loader.load_video_features("my_video.mp4")
+
+# features:       torch.Tensor of shape [T, 1280], or None if not found
+# label:          integer class index, or None
+# category_name:  str (e.g. "Gaming"), or None
+```
+
+If the video name is not in the index, the method returns `(None, None, None)` without raising.
+
+Internally the loader reads only the frames that were recorded as valid:
+
+```python
+with h5py.File(self.h5_path, 'r') as f:
+    num_frames_val = f['num_frames'][h5_idx]
+    features = f['features'][h5_idx][:num_frames_val]  # [T, feature_dim]
+
+features = torch.from_numpy(features.copy())
+```
+
+## SingleVideoClassifier
+
+`SingleVideoClassifier` loads the ensemble of checkpoint files and exposes `predict_standard` and `predict_with_tta`.
+
+### Constructor
+
+```python
+from test_already_extracted import SingleVideoClassifier
+
+classifier = SingleVideoClassifier(
+    checkpoint_paths=[
+        "models_enhanced/best_ensemble_model_1.pt",
+        "models_enhanced/best_ensemble_model_2.pt",
+        "models_enhanced/best_ensemble_model_3.pt",
+        "models_enhanced/best_ensemble_model_4.pt",
+    ],
+    device="cuda"
+)
+classifier.load_models()
+```
+
+<ParamField path="checkpoint_paths" type="list[str]" required>
+  List of paths to `.pt` checkpoint files. The classifier reads `model_config` from each checkpoint to reconstruct the `SuperEnhancedTemporalModel` architecture.
+</ParamField>
+
+<ParamField path="device" type="str" default="cuda">
+  Target device. Falls back to CPU automatically if CUDA is not available:
+
+  ```python
+  self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+  ```
+</ParamField>
+
+### Class names
+
+The classifier uses a fixed class ordering that matches the HDF5 category mapping:
+
+```python
+self.class_names = ['Animation', 'Flat_Content', 'Gaming', 'Natural_Content']
+```
+
+### predict_standard(features)
+
+Runs each ensemble model once and averages their softmax probabilities.
+
+```python
+probs = classifier.predict_standard(features)  # torch.Tensor, shape [4]
+```
+
+```python
+def predict_standard(self, features):
+    """Standard prediction (no TTA) - same as test_standard()"""
+    all_model_predictions = []
+
+    with torch.no_grad():
+        features_batch = features.unsqueeze(0).to(self.device)  # [1, T, D]
+        lengths = torch.tensor([features.shape[0]], device=self.device)
+
+        for model in self.models:
+            outputs = model(features_batch, lengths)  # [1, num_classes]
+            probs = F.softmax(outputs, dim=1)
+            all_model_predictions.append(probs.squeeze(0).cpu())
+
+    # Ensemble: average predictions
+    ensemble_probs = torch.stack(all_model_predictions).mean(dim=0)
+
+    return ensemble_probs
+```
+
+### predict_with_tta(features)
+
+Runs four temporal augmentations and averages their ensemble predictions. See the [TTA page](/inference/tta) for a full explanation.
+
+```python
+probs = classifier.predict_with_tta(features)  # torch.Tensor, shape [4]
+```
+
+## Full usage example
+
+```python
+import torch
+from test_already_extracted import SingleVideoFeatureLoader, SingleVideoClassifier
+
+# 1. Load features
+loader = SingleVideoFeatureLoader(
+    features_dir="features_enhanced",
+    processed_test_dir="data/processed/test"
+)
+
+features, label, category_name = loader.load_video_features("my_video.mp4")
+
+if features is None:
+    print("Video not found in dataset")
+else:
+    # 2. Load classifier
+    classifier = SingleVideoClassifier(
+        checkpoint_paths=[
+            "models_enhanced/best_ensemble_model_1.pt",
+            "models_enhanced/best_ensemble_model_2.pt",
+            "models_enhanced/best_ensemble_model_3.pt",
+            "models_enhanced/best_ensemble_model_4.pt",
+        ],
+        device="cuda"
+    )
+    classifier.load_models()
+
+    # 3. Predict
+    probs = classifier.predict_standard(features)
+    final_probs = probs.numpy().tolist()
+    predicted_idx = int(torch.tensor(final_probs).argmax())
+    predicted_class = classifier.class_names[predicted_idx]
+    confidence = final_probs[predicted_idx] * 100.0
+
+    print(f"Predicted: {predicted_class} ({confidence:.2f}%)")
+    print(f"All scores: {dict(zip(classifier.class_names, [p * 100 for p in final_probs]))}")
+```
+
+## API response format
+
+When a classification request is made through `/api/classify`, the server returns:
+
+```json
+{
+  "success": true,
+  "result": {
+    "category": "Gaming",
+    "confidence": 94.7,
+    "video_name": "my_video.mp4",
+    "all_scores": {
+      "Animation": 1.2,
+      "Flat_Content": 0.8,
+      "Gaming": 94.7,
+      "Natural_Content": 3.3
+    },
+    "model_scores": [
+      {
+        "model": "best_ensemble_model_1.pt",
+        "confidence": 93.1,
+        "probs": [1.5, 0.9, 93.1, 4.5]
+      },
+      {
+        "model": "best_ensemble_model_2.pt",
+        "confidence": 95.2,
+        "probs": [1.1, 0.7, 95.2, 3.0]
+      }
+    ]
+  }
+}
+```
+
+The `model_scores` array comes from the `per_model_scores()` helper in `app.py`, which runs each model independently and records its softmax distribution:
+
+```python
+def per_model_scores(classifier, features):
+    scores = []
+    device = classifier.device
+    features_batch = features.unsqueeze(0).to(device)  # [1, T, D]
+    lengths = torch.tensor([features.shape[0]], device=device)
+
+    with torch.no_grad():
+        for i, model in enumerate(classifier.models):
+            outputs = model(features_batch, lengths)  # [1, C]
+            probs = F.softmax(outputs, dim=1).squeeze(0).cpu().numpy()
+            model_name = Path(classifier.checkpoint_paths[i]).name
+            scores.append({"model": model_name, "probs": probs.tolist()})
+    return scores
+```
+
+All probability values in the response are expressed as percentages (0–100).
+
+<CardGroup cols={2}>
+  <Card title="Flask deployment" icon="server" href="/inference/flask-deployment">
+    Configure and start the Flask server.
+  </Card>
+  <Card title="Test-Time Augmentation" icon="layers" href="/inference/tta">
+    Boost accuracy to ~95% using TTA.
+  </Card>
+</CardGroup>

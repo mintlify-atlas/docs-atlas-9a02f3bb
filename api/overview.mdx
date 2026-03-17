@@ -1,0 +1,82 @@
+---
+title: "API overview"
+description: "Flask REST API for video classification inference"
+---
+
+## Base URL
+
+```
+http://localhost:5000
+```
+
+The API is designed for local deployment only. No authentication is required.
+
+## Endpoints
+
+<Columns cols={2}>
+  <Card title="GET /api/videos" icon="film" href="/api/videos">
+    List all available videos in the dataset, grouped by category.
+  </Card>
+  <Card title="POST /api/classify" icon="bolt" href="/api/classify">
+    Classify a dataset video using the four-model ensemble.
+  </Card>
+</Columns>
+
+## Authentication
+
+None required. The API is intended for local use only and does not implement any authentication scheme.
+
+## Response format
+
+All responses return `Content-Type: application/json`. Every response includes a `success` boolean field.
+
+**Success response:**
+```json
+{
+  "success": true,
+  ...
+}
+```
+
+**Error response:**
+```json
+{
+  "success": false,
+  "error": "Human-readable error message",
+  "trace": "Full Python traceback string"
+}
+```
+
+Error responses use HTTP status code `500` for server errors, or `400` for invalid request parameters.
+
+## Lazy model initialization
+
+<Note>
+Models are loaded on the **first request** to `/api/classify`. This means the first classification call may take several seconds while all four checkpoint files are read from disk into memory. Subsequent calls use the cached models and return significantly faster.
+</Note>
+
+The same applies to the feature loader — it is initialized once on the first request and reused for all subsequent calls.
+
+## CUDA auto-selection
+
+The server automatically detects GPU availability at startup:
+
+```python
+device_arg = 'cuda' if torch.cuda.is_available() and device == 'cuda' else 'cpu'
+```
+
+If a CUDA-capable GPU is present, inference runs on GPU. Otherwise it falls back to CPU. No configuration change is required.
+
+## Running the server
+
+```bash
+python app.py
+```
+
+The server starts on `0.0.0.0:5000` with debug mode enabled. At startup it prints the resolved paths for:
+
+- `index.html`
+- `test_already_extracted.py`
+- `features_enhanced/` directory
+- `models_enhanced/` directory
+- `data/processed/test/` directory

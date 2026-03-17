@@ -1,0 +1,162 @@
+---
+title: "Flask deployment"
+description: "Deploy the video classification system using the Flask web server"
+---
+
+## Overview
+
+The Flask application in `app.py` serves two purposes: it exposes a web UI via `index.html` and provides REST API endpoints for video classification. The server uses singleton lazy loading — `_feature_loader` and `_classifier` are instantiated on the first incoming request, so startup is fast and resources are only allocated when needed.
+
+`test_already_extracted.py` is not imported as a regular module. Instead, `app.py` uses `importlib` to load it dynamically at startup as `user_module`, which means `SingleVideoFeatureLoader` and `SingleVideoClassifier` are resolved at runtime from whatever file is present on disk.
+
+```python
+# Dynamically import user's script as module "user_module"
+spec = importlib.util.spec_from_file_location("user_module", str(USER_SCRIPT_PATH))
+user_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(user_module)
+```
+
+## Directory layout
+
+The following structure is expected next to `app.py`:
+
+```
+Flask Local New/
+├── app.py
+├── index.html
+├── model_train_new.py
+├── test_already_extracted.py
+├── features_enhanced/        ← pre-extracted HDF5 features
+├── models_enhanced/          ← ensemble checkpoint .pt files
+└── data/processed/test/      ← processed test data
+```
+
+## Configuration
+
+`app.py` resolves all paths relative to its own location (`BASE_DIR`), with fallbacks for cloud and Windows environments:
+
+| Variable | Primary | Fallback 1 | Fallback 2 |
+|---|---|---|---|
+| `FEATURES_DIR` | `features_enhanced/` | `/mnt/data/features_enhanced` | `D:/features_enhanced` |
+| `MODELS_DIR` | `models_enhanced/` | `/mnt/data/models_enhanced` | `D:/models_enhanced` |
+| `PROCESSED_TEST_DIR` | `data/processed/test/` | `/mnt/data/data/processed/test` | `D:/data/processed/test` |
+
+The four ensemble checkpoints loaded by default are:
+
+```python
+SELECTED_CHECKPOINTS = [
+    "best_ensemble_model_1.pt",
+    "best_ensemble_model_2.pt",
+    "best_ensemble_model_3.pt",
+    "best_ensemble_model_4.pt",
+]
+```
+
+<Warning>
+If none of the listed checkpoints exist in `MODELS_DIR`, `app.py` attempts a glob fallback (`*.pt`). If that also finds nothing, a `RuntimeError` is raised and the application will not start:
+
+```python
+if not paths:
+    raise RuntimeError(f"No checkpoints found in {MODELS_DIR}. Expected: {SELECTED_CHECKPOINTS}")
+```
+
+Ensure at least one `.pt` file is present in `MODELS_DIR` before starting the server.
+</Warning>
+
+## Starting the server
+
+<Steps>
+  <Step title="Install dependencies">
+    Install PyTorch, Flask, h5py, and the other requirements listed in your environment.
+  </Step>
+
+  <Step title="Place required files">
+    Verify that `features_enhanced/`, `models_enhanced/`, `data/processed/test/`, `index.html`, and `test_already_extracted.py` are all present next to `app.py`.
+  </Step>
+
+  <Step title="Run the server">
+    ```bash
+    python app.py
+    ```
+
+    On startup the server prints the resolved paths before binding:
+
+    ```
+    Index HTML path: /path/to/Flask Local New/index.html
+    User script path: /path/to/Flask Local New/test_already_extracted.py
+    Features dir: /path/to/Flask Local New/features_enhanced
+    Models dir: /path/to/Flask Local New/models_enhanced
+    Processed test dir: /path/to/Flask Local New/data/processed/test
+    ```
+
+    The server listens on `0.0.0.0:5000` with `debug=True`:
+
+    ```python
+    app.run(host="0.0.0.0", port=5000, debug=True)
+    ```
+  </Step>
+
+  <Step title="Open the UI">
+    Navigate to `http://localhost:5000` to access the web interface.
+  </Step>
+</Steps>
+
+## CUDA auto-detection
+
+The classifier is initialized with whichever device is available:
+
+```python
+device_arg = 'cuda' if torch.cuda.is_available() and device == 'cuda' else 'cpu'
+_classifier = user_module.SingleVideoClassifier(checkpoint_paths=paths, device=device_arg)
+```
+
+No manual configuration is required — the server falls back to CPU automatically if no GPU is present.
+
+## Singleton lazy loading
+
+Both the feature loader and classifier are module-level singletons initialized on first use:
+
+```python
+_feature_loader = None
+_classifier = None
+
+def get_feature_loader():
+    global _feature_loader
+    if _feature_loader is None:
+        _feature_loader = user_module.SingleVideoFeatureLoader(
+            features_dir=str(FEATURES_DIR),
+            processed_test_dir=str(PROCESSED_TEST_DIR)
+        )
+    return _feature_loader
+
+def get_classifier(device="cuda"):
+    global _classifier
+    if _classifier is None:
+        # ... resolve checkpoint paths ...
+        _classifier = user_module.SingleVideoClassifier(checkpoint_paths=paths, device=device_arg)
+        _classifier.load_models()
+    return _classifier
+```
+
+The first API call after startup will be slower as models are loaded into memory.
+
+## API endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` | Serves `index.html` |
+| `GET` | `/api/videos` | Lists available dataset videos grouped by category |
+| `POST` | `/api/classify` | Classifies a dataset video by name |
+
+<Note>
+`app.py` does not accept uploaded video files or external URLs through the API. Only videos already present in the test dataset (indexed from `features_enhanced/`) can be classified via `/api/classify`.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="Single video inference" icon="play" href="/inference/single-video">
+    How features are loaded and predictions are produced for a single video.
+  </Card>
+  <Card title="Test-Time Augmentation" icon="layers" href="/inference/tta">
+    Using TTA to improve classification accuracy from ~93% to ~95%.
+  </Card>
+</CardGroup>

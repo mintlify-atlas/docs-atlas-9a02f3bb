@@ -1,0 +1,198 @@
+---
+title: "Test-Time Augmentation (TTA)"
+description: "Boost accuracy from ~93% to ~95% using TTA during inference"
+---
+
+## What is TTA?
+
+Test-Time Augmentation (TTA) runs multiple augmented versions of the same input through the model and averages the resulting predictions. Because each augmentation presents a slightly different view of the data, their combined prediction is more robust than any single forward pass.
+
+In this system, augmentation is applied to the **temporal dimension** of the feature sequence — the order and density of sampled frames — rather than to pixel-level transformations.
+
+## Performance comparison
+
+| Mode | Accuracy | Weighted F1 |
+|---|---|---|
+| Standard inference | ~93% | ~92% |
+| With TTA | ~95% | >95% |
+
+The improvement comes from the four ensemble models seeing the sequence from multiple temporal perspectives before their predictions are averaged.
+
+## How TTA is implemented
+
+`predict_with_tta` in `SingleVideoClassifier` applies four temporal augmentations and averages the ensemble probabilities across all of them:
+
+```python
+def predict_with_tta(self, features):
+    """Prediction with TTA - same as test_with_tta()"""
+    tta_predictions = []
+
+    # TTA Mode 1: Original
+    probs = self.predict_standard(features)
+    tta_predictions.append(probs)
+
+    # TTA Mode 2: Reverse
+    features_reversed = torch.flip(features, dims=[0])
+    probs = self.predict_standard(features_reversed)
+    tta_predictions.append(probs)
+
+    # TTA Mode 3: Speed up (skip frames)
+    if features.shape[0] > 10:
+        indices = torch.linspace(0, features.shape[0]-1, features.shape[0]//2).long()
+        features_speedup = features[indices]
+        probs = self.predict_standard(features_speedup)
+        tta_predictions.append(probs)
+
+    # TTA Mode 4: Speed down (interpolate frames)
+    if features.shape[0] > 10:
+        indices = torch.linspace(0, features.shape[0]-1, int(features.shape[0]*1.5)).long()
+        indices = indices.clamp(max=features.shape[0]-1)
+        features_speeddown = features[indices]
+        probs = self.predict_standard(features_speeddown)
+        tta_predictions.append(probs)
+
+    # Average TTA predictions
+    ensemble_probs = torch.stack(tta_predictions).mean(dim=0)
+
+    return ensemble_probs
+```
+
+### Augmentation modes
+
+| Mode | Description | Sequence length |
+|---|---|---|
+| Original | Unmodified feature sequence | T (73) |
+| Reverse | Temporal order flipped (`torch.flip`) | T (73) |
+| Speed up | Uniformly subsampled to half the frames | T // 2 (36) |
+| Speed down | Uniformly upsampled to 1.5× the frames (index clamped) | T × 1.5 (109) |
+
+Modes 3 and 4 are only applied when `features.shape[0] > 10`.
+
+<Note>
+TTA results are deterministic. All four augmentations use fixed index sequences (no random sampling), so identical inputs always produce identical outputs.
+</Note>
+
+## Standard vs TTA comparison
+
+<Tabs>
+  <Tab title="Standard inference">
+    Runs each of the four ensemble models once on the original sequence and averages:
+
+    ```python
+    probs = classifier.predict_standard(features)
+    ```
+
+    ```python
+    def predict_standard(self, features):
+        all_model_predictions = []
+
+        with torch.no_grad():
+            features_batch = features.unsqueeze(0).to(self.device)  # [1, T, D]
+            lengths = torch.tensor([features.shape[0]], device=self.device)
+
+            for model in self.models:
+                outputs = model(features_batch, lengths)  # [1, num_classes]
+                probs = F.softmax(outputs, dim=1)
+                all_model_predictions.append(probs.squeeze(0).cpu())
+
+        ensemble_probs = torch.stack(all_model_predictions).mean(dim=0)
+        return ensemble_probs
+    ```
+
+    Forward passes: **4** (one per model)
+  </Tab>
+  <Tab title="TTA inference">
+    Runs four augmentations, each going through all four ensemble models:
+
+    ```python
+    probs = classifier.predict_with_tta(features)
+    ```
+
+    Forward passes: **up to 16** (4 augmentations × 4 models)
+
+    The additional passes account for most of the latency increase but deliver the ~2% accuracy improvement.
+  </Tab>
+</Tabs>
+
+## Enabling TTA via the API
+
+Pass `use_tta=true` as a form field in the `/api/classify` POST request:
+
+```bash
+curl -X POST http://localhost:5000/api/classify \
+  -F "selected_video=my_video.mp4" \
+  -F "use_tta=true"
+```
+
+The server reads the parameter and branches on it:
+
+```python
+use_tta = request.form.get("use_tta", "false").lower() == "true"
+# ...
+probs = clf.predict_with_tta(features) if use_tta else clf.predict_standard(features)
+```
+
+Omitting `use_tta` or setting it to `false` runs standard inference.
+
+### Example response with TTA enabled
+
+```json
+{
+  "success": true,
+  "result": {
+    "category": "Natural_Content",
+    "confidence": 97.3,
+    "video_name": "my_video.mp4",
+    "all_scores": {
+      "Animation": 0.6,
+      "Flat_Content": 0.9,
+      "Gaming": 1.2,
+      "Natural_Content": 97.3
+    },
+    "model_scores": [
+      {
+        "model": "best_ensemble_model_1.pt",
+        "confidence": 96.8,
+        "probs": [0.7, 1.0, 1.5, 96.8]
+      },
+      {
+        "model": "best_ensemble_model_2.pt",
+        "confidence": 97.5,
+        "probs": [0.5, 0.8, 1.2, 97.5]
+      },
+      {
+        "model": "best_ensemble_model_3.pt",
+        "confidence": 97.1,
+        "probs": [0.6, 0.9, 1.1, 97.4]
+      },
+      {
+        "model": "best_ensemble_model_4.pt",
+        "confidence": 97.8,
+        "probs": [0.6, 0.9, 1.0, 97.5]
+      }
+    ]
+  }
+}
+```
+
+## When to use TTA
+
+<Tip>
+Use standard inference for latency-sensitive applications. TTA multiplies the number of forward passes by up to 4×, which adds measurable latency — especially on CPU. Reserve TTA for production batch jobs or cases where accuracy is the priority.
+</Tip>
+
+| Scenario | Recommended mode |
+|---|---|
+| Production batch classification | TTA (`use_tta=true`) |
+| Real-time or interactive use | Standard (`use_tta=false`) |
+| Accuracy benchmarking | TTA |
+| Low-resource / CPU-only environments | Standard |
+
+<CardGroup cols={2}>
+  <Card title="Flask deployment" icon="server" href="/inference/flask-deployment">
+    Configure and start the Flask server.
+  </Card>
+  <Card title="Single video inference" icon="play" href="/inference/single-video">
+    How the feature loader and classifier are used together.
+  </Card>
+</CardGroup>
